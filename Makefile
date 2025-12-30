@@ -106,7 +106,7 @@ BUILD_DIR ?= build
 $(shell mkdir -p $(BUILD_DIR))
 
 ## compiler flags
-CFLAGS0 = -Wall -Wextra -Iinclude -std=c11 -fPIC -O3 -march=native \
+CFLAGS0 = -Wall -Wextra -Iinclude -std=c11 -fPIC -O3 -g3 -march=native \
 -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable
 
 
@@ -207,7 +207,7 @@ $(TARGET): $(OBJ)
 # Build the static library as well
 $(TARGET_STATIC): $(OBJ)
 	$(AR) rcs $@ $^
-	
+
 # Update test to use shared library
 test: $(TARGET) $(TEST_OBJ)
 	$(CC) $(CFLAGS) -o $(TEST_EXEC) $(TEST_OBJ) -L$(BUILD_DIR) -Wl,-rpath,$(shell pwd)/$(BUILD_DIR) -lbit
@@ -230,6 +230,6 @@ endif
 
 clean:
 	@rm -rf $(BUILD_DIR)
-    
+
 # Additional target to clean everything including dependencies
 distclean: clean

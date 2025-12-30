@@ -29,3 +29,4 @@
 
 # Custom build directories (when BUILD_DIR is specified)
 # Add specific paths here if you have common build locations
+.ccls-cache/

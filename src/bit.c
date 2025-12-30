@@ -19,14 +19,31 @@
 #include <stdio.h>   // For printf (if needed for debugging)
 #include <stdlib.h>  // For malloc, free
 #include <string.h>  // For memset
-
+#include <pthread.h> // POSIX thread safety for static data
+#include <threads.h>
 #ifdef USE_LIBPOPCNT
 #include "libpopcnt.h"
-#define BUFFER_SIZE 1024 /* Buffer size for popcnt operations */
 #endif
+#define BUFFER_SIZE 1024 /* Buffer size for popcnt operations */
 
 #define T Bit_T
 #define T_DB Bit_DB_T
+
+struct TA { /* T array */
+  T arr;
+  long max;
+  long nalloc;
+};
+
+struct BA { /* buffer array */
+  unsigned long long *arr;
+  long max;
+  long nalloc;
+};
+
+static thread_local struct TA TA;
+static thread_local struct BA BA;
+
 /*---------------------------------------------------------------------------*/
 // Bitset structure
 /*
@@ -94,8 +111,9 @@ struct T_DB {
   } else {                                                                     \
     assert(s->length == t->length);                                            \
     T set = Bit_new(s->length);                                                \
+    T foo = TA.arr + (long)set;                                                \
     for (int i = 0; i < s->size_in_qwords; i++) {                              \
-      set->qwords[i] = s->qwords[i] op t->qwords[i];                           \
+      (BA.arr + (long)foo->qwords)[i] = ((BA.arr + (long)s->qwords)[i] op (BA.arr + (long)t->qwords)[i]); \
     }                                                                          \
     return set;                                                                \
   }
@@ -115,7 +133,7 @@ struct T_DB {
     assert(s->length == t->length);                                            \
     uint64_t count = 0;                                                        \
     for (int i = 0; i < s->size_in_qwords; i++) {                              \
-      count += POPCOUNT(s->qwords[i] op t->qwords[i]);                         \
+      count += POPCOUNT((BA.arr + s->qwords)[i] op (BA.arr + (long)t->qwords)[i]); \
     }                                                                          \
     return (int)count;                                                         \
   }
@@ -137,13 +155,13 @@ struct T_DB {
     int i = 0;                                                                 \
     for (; i < limit; i += BUFFER_SIZE) {                                      \
       for (int j = 0; j < BUFFER_SIZE; j++) {                                  \
-        setop_buffer[j] = s->qwords[i + j] op t->qwords[i + j];                \
+        setop_buffer[j] = (BA.arr + (long)s->qwords)[i + j] op (BA.arr + (long)t->qwords)[i + j]; \
       }                                                                        \
       count += popcnt((void *)setop_buffer,                                    \
                       BUFFER_SIZE * sizeof(unsigned long long));               \
     }                                                                          \
     for (; i < s->size_in_qwords; i++) {                                       \
-      count += POPCOUNT(s->qwords[i] op t->qwords[i]);                         \
+      count += POPCOUNT((BA.arr + (long)s->qwords)[i] op (BA.arr + (long)t->qwords)[i]); \
     }                                                                          \
     return (int)count;                                                         \
   }
@@ -339,14 +357,17 @@ unsigned const char lsbmask[] = {0x01, 0x03, 0x07, 0x0F,
   Static Functions
  */
 
-static T copy(T t) {
+static inline T copy(T t) {
   T set;
+  t = TA.arr + (long)t;
   assert(t);
   set = Bit_new(t->length);
+  set = TA.arr + (long)set;
+
   if (t->length > 0) {
     memcpy(set->bytes, t->bytes, t->size_in_bytes);
   }
-  return set;
+  return (T)(TA.nalloc - 1);
 }
 
 /*
@@ -397,85 +418,130 @@ static inline uint64_t tree_adder(unsigned long long v) {
 #define POPCOUNT_GPU count_WWG // used to change GPU implementation
 /*---------------------------------------------------------------------------*/
 
+
+long T_alloc(size_t elts, size_t len, char *buffer) {
+
+  if (TA.arr == NULL) {
+    TA.arr = calloc(BUFFER_SIZE * BUFFER_SIZE, sizeof(struct T));
+    TA.max = BUFFER_SIZE * BUFFER_SIZE;
+  }
+  if (BA.arr == NULL) {
+    BA.arr = calloc(BUFFER_SIZE * BUFFER_SIZE, sizeof(unsigned long long));
+    BA.max = BUFFER_SIZE * BUFFER_SIZE;
+  }
+
+  while (elts > TA.max - TA.nalloc) {
+    size_t nelts = 2*TA.max;
+    TA.arr = realloc(TA.arr, nelts * sizeof(struct T));
+    TA.max = nelts;
+  }
+
+  while (len*elts * BPB > (BA.max - BA.nalloc) * BPQW) {
+    unsigned long long *arr = BA.arr;
+    size_t nelts = 2*BA.max;
+    BA.arr = realloc(BA.arr, nelts * sizeof(unsigned long long));
+    BA.max = nelts;
+  }
+
+  for (const int max = TA.nalloc + elts; TA.nalloc < max; TA.nalloc++) {
+    struct T *set = &TA.arr[TA.nalloc];
+    set->length = len;
+    set->size_in_qwords = nqwords(len);
+    set->size_in_bytes = set->size_in_qwords * BPQW / BPB;
+
+    if (buffer != NULL)
+      set->qwords = (unsigned long long *)buffer, buffer += set->size_in_bytes;
+    else
+      set->qwords = (unsigned long long *)(BA.nalloc), BA.nalloc += set->size_in_qwords;
+
+    set->bytes = (unsigned char *)(set->qwords);
+
+    set->is_Bit_T_allocated = (buffer == NULL); // allocated by the library?  ;
+  }
+
+  return TA.nalloc-elts;
+}
+
 // Functions that create, free and obtain the properties of the bitset.
 T Bit_new(int length) {
   assert(length > 0);
   assert(length < INT_MAX); // limit to 2^30 bits
   // alignment must be a multiple of sizeof(unsigned long long) or zero
-  T set = malloc(sizeof(*set));
-  set->length = length;
-
-  set->size_in_qwords = nqwords(length);
-  set->size_in_bytes = set->size_in_qwords * BPQW / BPB;
-
-  set->qwords = calloc(set->size_in_bytes, sizeof(unsigned char));
-  assert(set->qwords != NULL);
-
-  set->bytes = (unsigned char *)set->qwords;
-
-  set->is_Bit_T_allocated = true; // allocated by the library
-  return set;
+  return (T)T_alloc(1,length,NULL);
 }
 
 // return a pointer to the original buffer (if externally loaded) or NULL
 // otherwise
 void *Bit_free(T *set) {
-  assert(set && *set);
+
+  if ((long)(*set) != TA.nalloc-1)
+    return NULL;
+  *set = TA.arr + (long)(*set);
   void *original_location = (void *)(*set)->qwords;
+
   if ((*set)->is_Bit_T_allocated) {
+    memset(BA.arr + (long)original_location, 0, (*set)->size_in_bytes);
+    BA.nalloc -= (*set)->size_in_qwords;
     original_location = NULL;
-    free((*set)->qwords);
-    (*set)->qwords = NULL;
-    (*set)->bytes = NULL; // set bytes to NULL after freeing qwords
   }
-  free(*set);
+
+  **set = (struct T){0};
   *set = NULL;
+  TA.nalloc--;
   return original_location;
 }
 
 T Bit_load(int length, void *buffer) {
+
   assert(length > 0);
   assert(length < INT_MAX); // limit to 2^30 bits
   assert(buffer != NULL);
 
-  T set = malloc(sizeof(*set));
-  set->length = length;
-
-  set->size_in_qwords = nqwords(length);
-  set->size_in_bytes = set->size_in_qwords * BPQW / BPB;
-
-  set->bytes = (unsigned char *)buffer;
-  set->qwords =
-      (unsigned long long *)buffer; // set qwords to point to the buffer
-  set->is_Bit_T_allocated = false;  // not allocated by the library
-  return set;
+  return (T)T_alloc(1, length, buffer);
 }
 
 extern int Bit_extract(T set, void *buffer) {
+  set = TA.arr + (long)set;
   assert(set);
   assert(buffer != NULL);
   // Copy the bytes from the bitset to the buffer
-  memcpy(buffer, set->bytes, set->size_in_bytes);
+  if (set->is_Bit_T_allocated)
+    memcpy(buffer, BA.arr + (long)set->qwords, set->size_in_bytes);
+  else
+    memcpy(buffer, set->bytes, set->size_in_bytes);
   return set->size_in_bytes; // return the number of bytes written
 }
 
 /*---------------------------------------------------------------------------*/
 //     Functions that obtain the properties of a bitset:
 int Bit_length(T set) {
-  assert(set);
+  set = TA.arr + (long)set;
   return set->length;
 }
 
 int Bit_count(T set) {
-  assert(set);
+  set = TA.arr + (long)set;
+
   int length = 0;
+
+  if (set->is_Bit_T_allocated) {
 #ifndef USE_LIBPOPCNT
-  for (size_t i = 0; i < nqwords(set->length); i++) {
-    length += POPCOUNT(set->qwords[i]);
-  }
+    for (size_t i = 0; i < set->size_in_qwords; i++) {
+      length += POPCOUNT(BA.arr + (long)set->qwords + i);
+    }
 #else
-  length = (int)popcnt(set->bytes, set->size_in_bytes);
+    length = (int)popcnt(BA.arr + (long)set->qwords, set->size_in_bytes);
 #endif
+  }
+  else {
+#ifndef USE_LIBPOPCNT
+    for (size_t i = 0; i < set->size_in_qwords; i++) {
+      length += POPCOUNT(set->qwords[i]);
+    }
+#else
+    length = (int)popcnt(set->bytes, set->size_in_bytes);
+#endif
+  }
   return length;
 }
 
@@ -487,64 +553,104 @@ int Bit_buffer_size(int length) {
 /*---------------------------------------------------------------------------*/
 // Functions that manipulate an individual bitset (member operations):
 void Bit_aset(T set, int indices[], int n) {
-  assert(set);
   assert(indices);
-  for (int i = 0; i < n; i++) {
-    assert(indices[i] >= 0 && indices[i] < set->length);
-    set->bytes[indices[i] / BPB] |= 1 << (indices[i] % BPB);
-  }
+  set = TA.arr + (long)set;
+  if (set->is_Bit_T_allocated)
+    for (int i = 0; i < n; i++) {
+      assert(indices[i] >= 0 && indices[i] < set->length);
+      ((unsigned char *)(BA.arr + (long)(set->bytes)))[indices[i] / BPB] |= 1 << (indices[i] % BPB);
+    }
+  else
+    for (int i = 0; i < n; i++) {
+      assert(indices[i] >= 0 && indices[i] < set->length);
+      (set->bytes)[indices[i] / BPB] |= 1 << (indices[i] % BPB);
+    }
+
 }
+
 void Bit_aclear(T set, int indices[], int n) {
-  assert(set);
   assert(indices);
-  for (int i = 0; i < n; i++) {
-    assert(indices[i] >= 0 && indices[i] < set->length);
-    set->bytes[indices[i] / BPB] &= ~(1 << (indices[i] % BPB));
-  }
+  set = TA.arr + (long)set;
+  if (set->is_Bit_T_allocated)
+    for (int i = 0; i < n; i++) {
+      assert(indices[i] >= 0 && indices[i] < set->length);
+      ((unsigned char *)(BA.arr + (long)(set->bytes)))[indices[i] / BPB] &= ~(1 << (indices[i] % BPB));
+    }
+  else
+    for (int i = 0; i < n; i++) {
+      assert(indices[i] >= 0 && indices[i] < set->length);
+      (set->bytes)[indices[i] / BPB] &= ~(1 << (indices[i] % BPB));
+    }
 }
+
 void Bit_bset(T set, int index) {
-  assert(set);
+  set = TA.arr + (long)set;
   assert(index >= 0 && index < set->length);
-  set->bytes[index / BPB] |= 1 << (index % BPB);
+  if (set->is_Bit_T_allocated)
+    ((unsigned char *)(BA.arr + (long)(set->bytes)))[index / BPB] |= 1 << (index % BPB);
+  else
+    (set->bytes)[index / BPB] |= 1 << (index % BPB);
 }
 
 void Bit_bclear(T set, int index) {
-  assert(set);
+  set = TA.arr + (long)set;
   assert(index >= 0 && index < set->length);
-  set->bytes[index / BPB] &= ~(1 << (index % BPB));
+  if (set->is_Bit_T_allocated)
+    ((unsigned char *)(BA.arr + (long)(set->bytes)))[index / BPB] &= ~(1 << (index % BPB));
+  else
+    (set->bytes)[index / BPB] &= ~(1 << (index % BPB));
 }
 
 void Bit_clear(T set, int lo, int hi) {
-  assert(set);
+  set = TA.arr + (long)set;
   assert(0 <= lo && hi < set->length);
   assert(lo <= hi);
-  if (lo / 8 < hi / 8) {
-    // clear the most significant bits in byte lo/8
-    set->bytes[lo / 8] &= ~msbmask[lo % 8];
+  if (set->is_Bit_T_allocated) {
+    if (lo / 8 < hi / 8) {
+      // clear the most significant bits in byte lo/8
+      ((unsigned char *)(BA.arr + (long)(set->bytes)))[lo / 8] &= ~msbmask[lo % 8];
     // clear the least significant bits in byte hi/8
-    set->bytes[hi / 8] &= ~lsbmask[hi % 8];
+      ((unsigned char *)(BA.arr + (long)(set->bytes)))[hi / 8] &= ~lsbmask[hi % 8];
     // clear the bits in between
-    for (int i = lo / 8 + 1; i < hi / 8; i++)
-      set->bytes[i] = 0;
+      for (int i = lo / 8 + 1; i < hi / 8; i++)
+        ((unsigned char *)(BA.arr + (long)(set->bytes)))[i] = 0;
 
-  } else // lo and hi are in the same byte
-    set->bytes[lo / 8] &= ~(msbmask[lo % 8] & lsbmask[hi % 8]);
+    } else // lo and hi are in the same byte
+      ((unsigned char *)(BA.arr + (long)(set->bytes)))[lo / 8] &= ~(msbmask[lo % 8] & lsbmask[hi % 8]);
+  }
+  else {
+    if (lo / 8 < hi / 8) {
+      // clear the most significant bits in byte lo/8
+      set->bytes[lo / 8] &= ~msbmask[lo % 8];
+      // clear the least significant bits in byte hi/8
+      set->bytes[hi / 8] &= ~lsbmask[hi % 8];
+      // clear the bits in between
+      for (int i = lo / 8 + 1; i < hi / 8; i++)
+        set->bytes[i] = 0;
+
+    } else // lo and hi are in the same byte
+      set->bytes[lo / 8] &= ~(msbmask[lo % 8] & lsbmask[hi % 8]);
+  }
 }
+
 int Bit_get(T set, int index) {
-  assert(set);
+  set = TA.arr + (long)set;
   assert(index >= 0 && index < set->length);
-  return ((set->bytes[index / BPB] >> (index % BPB)) & 1);
+  if (set->is_Bit_T_allocated)
+    return ((((unsigned char *)(BA.arr + (long)(set->bytes)))[index / BPB]  >> (index % BPB)) & 1);
+  else
+    return (((set->bytes)[index / BPB]  >> (index % BPB)) & 1);
 }
 
 void Bit_map(T set, void apply(int n, int bit, void *cl), void *cl) {
-  assert(set);
+  set = TA.arr + (long)set;
   for (int i = 0; i < set->length; i++) {
     apply(i, ((set->bytes[i / BPB] >> (i % BPB)) & 1), cl);
   }
 }
 
 void Bit_not(T set, int lo, int hi) {
-  assert(set);
+  set = TA.arr + (long)set;
   assert(0 <= lo && hi < set->length);
   assert(lo <= hi);
   if (lo / 8 < hi / 8) {
@@ -561,74 +667,141 @@ void Bit_not(T set, int lo, int hi) {
 }
 int Bit_put(T set, int index, int bit) {
   int prev;
-  assert(set);
+  set = TA.arr + (long)set;
   assert(bit == 0 || bit == 1);
   assert(0 <= index && index < set->length);
-  prev = ((set->bytes[index / BPB] >> (index % BPB)) & 1);
-  if (bit == 1)
-    set->bytes[index / BPB] |= 1 << (index % BPB);
-  else
-    set->bytes[index / BPB] &= ~(1 << (index % BPB));
+  if (set->is_Bit_T_allocated) {
+    prev = ((((unsigned char *)(BA.arr + (long)(set->bytes)))[index / BPB] >>
+             (index % BPB)) & 1);
+    if (bit == 1)
+      ((unsigned char *)(BA.arr + (long)(set->bytes)))[index / BPB] |=
+          1 << (index % BPB);
+    else
+      ((unsigned char *)(BA.arr + (long)(set->bytes)))[index / BPB] &=
+          ~(1 << (index % BPB));
+  } else {
+    prev = (((set->bytes)[index / BPB] >> (index % BPB)) & 1);
+    if (bit == 1)
+      (set->bytes)[index / BPB] |= 1 << (index % BPB);
+    else
+      (set->bytes)[index / BPB] &= ~(1 << (index % BPB));
+  }
   return prev;
 }
 
 void Bit_set(T set, int lo, int hi) {
-  assert(set);
+  set = TA.arr + (long)set;
   assert(0 <= lo && hi < set->length);
   assert(lo <= hi);
-  if (lo / 8 < hi / 8) {
-    // set the most significant bits in byte lo/8
-    set->bytes[lo / 8] |= msbmask[lo % 8];
-    // clear the least significant bits in byte hi/8
-    set->bytes[hi / 8] |= lsbmask[hi % 8];
-    // clear the bits in between
-    for (int i = lo / 8 + 1; i < hi / 8; i++)
-      set->bytes[i] = 0xFF;
-
-  } else // lo and hi are in the same byte
-    set->bytes[lo / 8] |= (msbmask[lo % 8] & lsbmask[hi % 8]);
+  if (set->is_Bit_T_allocated) {
+    if (lo / 8 < hi / 8) {
+      // set the most significant bits in byte lo/8
+      ((unsigned char *)(BA.arr + (long)(set->bytes)))[lo / 8] |=
+          msbmask[lo % 8];
+      // clear the least significant bits in byte hi/8
+      ((unsigned char *)(BA.arr + (long)(set->bytes)))[hi / 8] |=
+          lsbmask[hi % 8];
+      // clear the bits in between
+      for (int i = lo / 8 + 1; i < hi / 8; i++)
+        ((unsigned char *)(BA.arr + (long)(set->bytes)))[i] = 0xFF;
+    } else // lo and hi are in the same byte
+      ((unsigned char *)(BA.arr + (long)(set->bytes)))[lo / 8] |=
+          (msbmask[lo % 8] & lsbmask[hi % 8]);
+  } else {
+    if (lo / 8 < hi / 8) {
+      // set the most significant bits in byte lo/8
+      (set->bytes)[lo / 8] |= msbmask[lo % 8];
+      // clear the least significant bits in byte hi/8
+      (set->bytes)[hi / 8] |= lsbmask[hi % 8];
+      // clear the bits in between
+      for (int i = lo / 8 + 1; i < hi / 8; i++)
+        (set->bytes)[i] = 0xFF;
+    } else // lo and hi are in the same byte
+      (set->bytes)[lo / 8] |= (msbmask[lo % 8] & lsbmask[hi % 8]);
+  }
 }
 /*---------------------------------------------------------------------------*/
 // Functions that compare two bitsets
 
 int Bit_eq(T s, T t) {
-  assert(s && t);
+  s = TA.arr + (long)s, t = TA.arr + (long)t;
   assert(s->length == t->length);
-  for (int i = s->size_in_qwords; --i >= 0;)
-    if (s->qwords[i] != t->qwords[i])
-      return 0;
+  if (s->is_Bit_T_allocated) {
+    for (int i = s->size_in_qwords - 1; --i >= 0;)
+      if ((BA.arr + (long)s->qwords)[i] != (BA.arr + (long)t->qwords)[i])
+        return 0;
+  }
+  else
+    for (int i = s->size_in_qwords - 1; --i >= 0;)
+      if (s->qwords[i] != t->qwords[i])
+        return 0;
   return 1;
 }
 
 int Bit_leq(T s, T t) {
-  assert(s && t);
+  s = TA.arr + (long)s, t = TA.arr + (long)t;
+
   assert(s->length == t->length);
-  for (int i = s->size_in_qwords; --i >= 0;)
-    if ((s->qwords[i] & ~t->qwords[i]) != 0)
-      return 0;
+  if (s->is_Bit_T_allocated) {
+    for (int i = s->size_in_qwords - 1; --i >= 0;)
+      if (((BA.arr + (long)s->qwords)[i] & ~((BA.arr + (long)t->qwords)[i])) != 0)
+        return 0;
+  } else
+    for (int i = s->size_in_qwords - 1; --i >= 0;)
+      if ((s->qwords[i] & ~t->qwords[i]) != 0)
+        return 0;
   return 1;
 }
 
 int Bit_lt(T s, T t) {
-  assert(s && t);
+  s = TA.arr + (long)s, t = TA.arr + (long)t;
+
   assert(s->length == t->length);
   int lt = 0;
-  for (int i = s->size_in_qwords; --i >= 0;)
-    if ((s->qwords[i] & ~t->qwords[i]) != 0)
-      return 0;
-    else if ((s->qwords[i] & t->qwords[i]) != 0)
-      lt |= 1;
+  if (s->is_Bit_T_allocated && t->is_Bit_T_allocated) {
+    for (int i = s->size_in_qwords - 1; --i >= 0;)
+      if (((BA.arr + (long)s->qwords)[i] & ~((BA.arr + (long)t->qwords)[i])) != 0)
+        return 0;
+      else if (((BA.arr + (long)s->qwords)[i] &
+                (BA.arr + (long)t->qwords)[i]) != 0)
+        lt |= 1;
+  } else if (s->is_Bit_T_allocated) {
+    for (int i = s->size_in_qwords - 1; --i >= 0;)
+      if (((BA.arr + (long)s->qwords)[i] & ~(t->qwords[i])) != 0)
+        return 0;
+      else if (((BA.arr + (long)s->qwords)[i] & (t->qwords)[i]) != 0)
+        lt |= 1;
+  } else if (t->is_Bit_T_allocated) {
+    for (int i = s->size_in_qwords - 1; --i >= 0;)
+      if (((s->qwords)[i] & ~((BA.arr + (long)t->qwords)[i])) != 0)
+        return 0;
+      else if (((s->qwords)[i] & ((BA.arr + (long)t->qwords)[i])) != 0)
+        lt |= 1;
+  } else {
+    for (int i = s->size_in_qwords - 1; --i >= 0;)
+      if ((s->qwords[i] & ~(t->qwords[i])) != 0)
+        return 0;
+      else if ((s->qwords[i] & t->qwords[i]) != 0)
+        lt |= 1;
+  }
   return lt;
 }
 /*---------------------------------------------------------------------------*/
 // Functions that operate on two bitsets (and create a new one)
 
-T Bit_diff(T s, T t) { setop(Bit_new(s->length), copy(t), copy(s), ^); }
+T Bit_diff(T s, T t) {
+  s = TA.arr + (long)s, t = TA.arr + (long)t;
+  setop(TA.arr + (long)Bit_new(s->length), copy(t), copy(s), ^); }
 T Bit_minus(T s, T t) {
-  setop(Bit_new(s->length), Bit_new(t->length), copy(s), &~);
+  s = TA.arr + (long)s, t = TA.arr + (long)t;
+  setop(Bit_new(s->length), TA.arr + (long)Bit_new(t->length), copy(s), &~);
 }
-T Bit_inter(T s, T t){setop(copy(t), Bit_new(t->length),
-                            Bit_new(s->length), &)} T Bit_union(T s, T t) {
+T Bit_inter(T s, T t){
+  s = TA.arr + (long)s, t = TA.arr + (long)t;
+  setop(copy(t), TA.arr + (long)Bit_new(t->length),TA.arr + (long)Bit_new(s->length), &);
+}
+T Bit_union(T s, T t) {
+  s = TA.arr + (long)s, t = TA.arr + (long)t;
   setop(copy(t), copy(t), copy(s), |)
 }
 
@@ -636,10 +809,14 @@ T Bit_inter(T s, T t){setop(copy(t), Bit_new(t->length),
 // Functions that operate on two bitsets (and return the population count of
 // the result)
 
-int Bit_diff_count(T s, T t) { setop_count(0, Bit_count(t), Bit_count(s), ^); }
-int Bit_minus_count(T s, T t) { setop_count(0, 0, Bit_count(s), &~); }
-int Bit_inter_count(T s, T t) { setop_count(Bit_count(t), 0, 0, &); }
-int Bit_union_count(T s, T t) {
+int Bit_diff_count(T s, T t) {  s = TA.arr + (long)s, t = TA.arr + (long)t;
+ setop_count(0, Bit_count(t), Bit_count(s), ^); }
+int Bit_minus_count(T s, T t) {  s = TA.arr + (long)s, t = TA.arr + (long)t;
+ setop_count(0, 0, Bit_count(s), &~); }
+int Bit_inter_count(T s, T t) {  s = TA.arr + (long)s, t = TA.arr + (long)t;
+ setop_count(Bit_count(t), 0, 0, &); }
+int Bit_union_count(T s, T t) {  s = TA.arr + (long)s, t = TA.arr + (long)t;
+
   setop_count(Bit_count(t), Bit_count(t), Bit_count(s), |);
 }
 
@@ -770,16 +947,18 @@ extern T BitDB_get_from(T_DB set, int index) {
   assert(set);
   assert(index >= 0 && index < set->nelem);
   T bitset = Bit_new(set->length);
+  T foo = TA.arr + (long)bitset;
   size_t shift = (size_t)index;
   shift *= set->size_in_bytes; // calculate the offset
   // Copy the bytes from the set to the new bitset
-  memcpy(bitset->bytes, set->bytes + shift, set->size_in_bytes);
+  memcpy(foo->bytes, set->bytes + shift, set->size_in_bytes);
   return bitset;
 }
 
 extern void BitDB_put_at(T_DB set, int index, T bitset) {
   assert(set);
   assert(index >= 0 && index < set->nelem);
+  bitset = TA.arr + (long)bitset;
   assert(bitset);
   assert(bitset->length == set->length);
   // Copy the bytes from the bitset to the set
